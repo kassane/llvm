@@ -2680,6 +2680,17 @@ bool PPCTargetLowering::SelectAddressRegImm(
   // FIXME dl should come from parent load or store, not from address
   SDLoc dl(N);
 
+  // ILP32-on-PPC64 (PS3/lv2): global/TOC address materialization produces a
+  // 64-bit address which getTOCEntry truncates to the 32-bit pointer width.
+  // When such a pointer feeds a memory access, address with the underlying
+  // 64-bit value (the real address) instead of the truncated i32, which would
+  // otherwise require an impossible 32-bit-base -> 64-bit-base register copy.
+  // This mirrors GCC's POINTERS_EXTEND_UNSIGNED handling on powerpc64-ps3-elf.
+  if (Subtarget.isPPC64() && getPointerTy(DAG.getDataLayout()) == MVT::i32 &&
+      N.getOpcode() == ISD::TRUNCATE && N.getValueType() == MVT::i32 &&
+      N.getOperand(0).getValueType() == MVT::i64)
+    N = N.getOperand(0);
+
   // If we have a PC Relative target flag don't select as [reg+imm]. It will be
   // a [pc+imm].
   if (SelectAddressPCRel(N, Base))
@@ -3061,10 +3072,23 @@ SDValue PPCTargetLowering::getTOCEntry(SelectionDAG &DAG, const SDLoc &dl,
                     ? DAG.getRegister(PPC::R2, VT)
                     : DAG.getNode(PPCISD::GlobalBaseReg, dl, VT);
   SDValue Ops[] = { GA, Reg };
-  return DAG.getMemIntrinsicNode(
+  SDValue TocEntry = DAG.getMemIntrinsicNode(
       PPCISD::TOC_ENTRY, dl, DAG.getVTList(VT, MVT::Other), Ops, VT,
       MachinePointerInfo::getGOT(DAG.getMachineFunction()), std::nullopt,
       MachineMemOperand::MOLoad);
+
+  // The PS3 (OS lv2) target is ILP32-on-PPC64: pointers are 32 bits wide
+  // (datalayout -p:32:32) even though the TOC slot loaded above is a 64-bit
+  // doubleword. Truncate the loaded value back to the (narrower) pointer width
+  // so that callers receive a value of the type they expect, instead of an
+  // i64 that later has to be any_extend'ed (which has no ISel pattern, see
+  // llvm-project#169283). This mirrors GCC's POINTERS_EXTEND_UNSIGNED handling
+  // on powerpc64-ps3-elf.
+  EVT GAVT = GA.getValueType();
+  if (GAVT.isInteger() && GAVT.bitsLT(VT))
+    return DAG.getNode(ISD::TRUNCATE, dl, GAVT, TocEntry);
+
+  return TocEntry;
 }
 
 SDValue PPCTargetLowering::LowerConstantPool(SDValue Op,
@@ -5463,6 +5487,15 @@ static SDValue transformCallee(const SDValue &Callee, SelectionDAG &DAG,
     return DAG.getMCSymbol(S, PtrVT);
   };
 
+  // On the 64-bit ELF ABI a direct call references its target through a 64-bit
+  // relocation (bl + TOC-restore nop) regardless of the source pointer width.
+  // For the ILP32-on-PPC64 PS3/lv2 target the callee value type is i32, which
+  // does not match the i64 call patterns and aborts ISel on PPCISD::CALL_NOP
+  // (llvm-project#55456). Reference the symbol at the scalar integer width so
+  // the existing 64-bit call patterns match; the relocation is width-agnostic.
+  EVT CalleeVT = Subtarget.is64BitELFABI() ? Subtarget.getScalarIntVT()
+                                           : Callee.getValueType();
+
   auto *G = dyn_cast<GlobalAddressSDNode>(Callee);
   const GlobalValue *GV = G ? G->getGlobal() : nullptr;
   if (isFunctionGlobalAddress(GV)) {
@@ -5471,7 +5504,7 @@ static SDValue transformCallee(const SDValue &Callee, SelectionDAG &DAG,
     if (Subtarget.isAIXABI()) {
       return getAIXFuncEntryPointSymbolSDNode(GV);
     }
-    return DAG.getTargetGlobalAddress(GV, dl, Callee.getValueType(), 0,
+    return DAG.getTargetGlobalAddress(GV, dl, CalleeVT, 0,
                                       UsePlt ? PPCII::MO_PLT : 0);
   }
 
@@ -20706,6 +20739,17 @@ PPC::AddrMode PPCTargetLowering::SelectOptimalAddrMode(const SDNode *Parent,
                                                        SelectionDAG &DAG,
                                                        MaybeAlign Align) const {
   SDLoc DL(Parent);
+
+  // ILP32-on-PPC64 (PS3/lv2): global/TOC address materialization yields a
+  // 64-bit address that getTOCEntry truncates to the 32-bit pointer width.
+  // When such a pointer feeds a memory access, address with the underlying
+  // 64-bit value (the real address) instead of the truncated i32, which would
+  // otherwise require an impossible 32-bit-base -> 64-bit-base register copy.
+  // This mirrors GCC's POINTERS_EXTEND_UNSIGNED handling on powerpc64-ps3-elf.
+  if (Subtarget.isPPC64() && getPointerTy(DAG.getDataLayout()) == MVT::i32 &&
+      N.getOpcode() == ISD::TRUNCATE && N.getValueType() == MVT::i32 &&
+      N.getOperand(0).getValueType() == MVT::i64)
+    N = N.getOperand(0);
 
   // Compute the address flags.
   unsigned Flags = computeMOFlags(Parent, N, DAG);

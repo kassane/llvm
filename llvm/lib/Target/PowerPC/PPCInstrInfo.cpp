@@ -1907,6 +1907,32 @@ void PPCInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
 
     return;
 
+  } else if (PPC::G8RCRegClass.contains(DestReg) &&
+             PPC::GPRCRegClass.contains(SrcReg)) {
+    // ILP32-on-PPC64 (powerpc64-ps3/lv2): a 32-bit GPR value used in a 64-bit
+    // GPR (e.g. an i32 pointer used as a 64-bit memory base). A GPRC register
+    // is the low word of its G8RC super-register, so zero-extend it into the
+    // destination (POINTERS_EXTEND_UNSIGNED=1).
+    const TargetRegisterInfo &TRI = getRegisterInfo();
+    MCRegister SrcReg64 =
+        TRI.getMatchingSuperReg(SrcReg, PPC::sub_32, &PPC::G8RCRegClass);
+    BuildMI(MBB, I, DL, get(PPC::RLDICL), DestReg)
+        .addReg(SrcReg64, getKillRegState(KillSrc))
+        .addImm(0)
+        .addImm(32);
+    return;
+
+  } else if (PPC::GPRCRegClass.contains(DestReg) &&
+             PPC::G8RCRegClass.contains(SrcReg)) {
+    // The reverse: truncate a 64-bit GPR to a 32-bit GPR by copying its low
+    // word (a 32-bit OR with itself, i.e. `mr`).
+    const TargetRegisterInfo &TRI = getRegisterInfo();
+    MCRegister SrcReg32 = TRI.getSubReg(SrcReg, PPC::sub_32);
+    BuildMI(MBB, I, DL, get(PPC::OR), DestReg)
+        .addReg(SrcReg32, getKillRegState(KillSrc))
+        .addReg(SrcReg32, getKillRegState(KillSrc));
+    return;
+
   } else
     llvm_unreachable("Impossible reg-to-reg copy");
 
